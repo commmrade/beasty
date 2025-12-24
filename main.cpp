@@ -26,6 +26,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include <print>
 #include <memory>
+#include <type_traits>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 
@@ -74,26 +75,34 @@ private:
     }
 };
 
-class Session : public std::enable_shared_from_this<Session> {
+template<typename T>
+concept Service = requires(T a, request req) {
+    { a.route(req) } -> std::convertible_to<response>;
+};
+
+
+
+template<Service S>
+class Session : public std::enable_shared_from_this<Session<S>> {
     boost::beast::tcp_stream stream_;
     boost::beast::flat_buffer buf_;
     request recv_msg_;
     response send_msg_;
 
-    Bank bank_;
+    S& service_;
 public:
-    Session(boost::asio::ip::tcp::socket&& sock) : stream_(std::move(sock)) {}
+    Session(boost::asio::ip::tcp::socket&& sock, S& service) : stream_(std::move(sock)), service_(service) {}
 
     void process() {
         stream_.expires_after(std::chrono::seconds(30)); // Drops connection after specified time
         // shared_from_this to keep object alive, since it is supposed to be dead at this point in Server::start_accept
-        boost::beast::http::async_read(stream_, buf_, recv_msg_, std::bind(&Session::do_read, shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
+        boost::beast::http::async_read(stream_, buf_, recv_msg_, std::bind(&Session::do_read, this->shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
     }
 
     void do_read(const boost::system::error_code& err, std::size_t bytes_tf) {
         if (!err) {
-            send_msg_ = bank_.route(recv_msg_);
-            boost::beast::http::async_write(stream_, send_msg_, std::bind(&Session::do_write, shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
+            send_msg_ = service_.route(recv_msg_);
+            boost::beast::http::async_write(stream_, send_msg_, std::bind(&Session::do_write, this->shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
         } else {
             std::println("Read failed: {}", err.message());
         }
@@ -118,9 +127,12 @@ public:
     }
 };
 
+template<Service S>
 class Server {
     boost::asio::io_context& io_;
     boost::asio::ip::tcp::acceptor acceptor_;
+
+    S bank_;
 public:
     Server(boost::asio::io_context& io, boost::asio::ip::address addr, unsigned short port) : io_(io), acceptor_(io, {addr, port}) {
         acceptor_.set_option(boost::asio::socket_base::reuse_address{true});
@@ -130,7 +142,7 @@ public:
     void start_accept() {
         acceptor_.async_accept([this](const boost::system::error_code& err, boost::asio::ip::tcp::socket sock) {
             if (!err) {
-                auto session = std::make_shared<Session>(std::move(sock));
+                auto session = std::make_shared<Session<S>>(std::move(sock), bank_);
                 session->process();
             }
             start_accept();
@@ -141,7 +153,7 @@ public:
 
 int main(int, char**){
     boost::asio::io_context io;
-    Server serv{io, boost::asio::ip::make_address("127.0.0.1"), 8000};
+    Server<Bank> serv{io, boost::asio::ip::make_address("127.0.0.1"), 8000};
     io.run();
     return 0;
 }
